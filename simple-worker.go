@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -33,9 +34,40 @@ func (j *Job[T, K]) Execute() Result[K] {
 	}
 }
 
-func worker[T, K any](wg *sync.WaitGroup, id int, jobs <-chan Job[T, K], results chan<- Result[K], shutdown <-chan bool) {
-	defer wg.Done()
+type WorkerPool[T, K any] struct {
+	workerCount int
+	jobs        chan Job[T, K]
+	results     chan Result[K]
+	done        chan struct{}
+}
 
+func New[T, K any](numWorkers int, jobQueue chan Job[T, K]) WorkerPool[T, K] {
+	return WorkerPool[T, K]{
+		workerCount: numWorkers,
+		jobs:        jobQueue,
+		results:     make(chan Result[K]),
+		done:        make(chan struct{}),
+	}
+}
+
+func (wp *WorkerPool[T, K]) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := 1; i <= wp.workerCount; i++ {
+		wg.Add(1)
+		go worker(ctx, &wg, i, wp.jobs, wp.results)
+	}
+
+	wg.Wait()
+	close(wp.results)
+	close(wp.done)
+}
+
+func (wp *WorkerPool[T, K]) Results() <-chan Result[K] {
+	return wp.results
+}
+
+func worker[T, K any](ctx context.Context, wg *sync.WaitGroup, id int, jobs <-chan Job[T, K], results chan<- Result[K]) {
+	defer wg.Done()
 	for {
 		select {
 		case job, ok := <-jobs:
@@ -45,7 +77,10 @@ func worker[T, K any](wg *sync.WaitGroup, id int, jobs <-chan Job[T, K], results
 			fmt.Printf("Worker %d running job %d \n", id, job.ID)
 			result := job.Execute()
 			results <- result
-		case <-shutdown:
+		case <-ctx.Done():
+			results <- Result[K]{
+				Err: ctx.Err(),
+			}
 			fmt.Println("Shutting down`")
 			return
 		}
@@ -66,14 +101,14 @@ func runWorker() {
 	)
 
 	jobQueue := make(chan Job[any, any], tasks)
-	resultQueue := make(chan Result[any], tasks)
-	shutdown := make(chan bool)
 
-	var wg sync.WaitGroup
-	for w := 1; w <= concurreny; w++ {
-		wg.Add(1)
-		go worker(&wg, w, jobQueue, resultQueue, shutdown)
-	}
+	wp := New[any, any](concurreny, jobQueue)
+
+	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*2)
+	defer cancel()
+
+	go wp.Run(ctx)
+	// cancel()
 
 	go func() {
 		defer close(jobQueue)
@@ -86,14 +121,20 @@ func runWorker() {
 		}
 	}()
 
-	go func() {
-		defer close(resultQueue)
+	for {
+		select {
+		case result, ok := <-wp.results:
+			if !ok {
+				continue
+			}
 
-		for r := range resultQueue {
-			fmt.Printf("Result %d \n", r.Value)
+			if result.Err != nil {
+				fmt.Printf("Got result error %s \n", result.Err.Error())
+				return
+			}
+			fmt.Printf("Got result %d \n", result.Value.(int))
+		case <-wp.done:
+			return
 		}
-	}()
-
-	wg.Wait()
-
+	}
 }
